@@ -11,14 +11,22 @@ Method (see the prep plan for the reasoning; this file is the whole model):
     players-tracked count and the same rates carry no information, so they are
     folded into one state.  E is recovered as round(rate * N / 100).
   * Extrapolate ln N and ln E against ln(1 + hours since release) by weighted
-    least squares, with recency weights.  Small-E trophies have their slope
+    least squares over the recent states (last 40 hours), with weights that
+    grow quadratically toward the present.  Small-E trophies have their slope
     shrunk toward a pooled slope (by tier group when there are few states,
-    across all trophies when there are fewer still).  A second E estimate from
-    the latest increment ratio dE/dN is averaged in when refreshes exist.
-  * Median rate r50 = E(target) / N(target).  The story chain
-    Ch.1 >= Ch.2 >= Ch.3 >= Ch.4 >= final >= 100% >= platinum is enforced on
-    the medians, Gone Fishing (id 2) is pinned near 100%, and the platinum is
-    capped low: almost nobody legitimately platinums the game in week one.
+    across all trophies when there are fewer still).  The E extrapolation
+    blends the last-state-anchored line with the regression line's own value
+    at the target, so one dipped refresh cannot drag the forecast down.
+  * Median rate r50 = E(target) / N(target), blended in logit space with a
+    curve-style median (logit rate fit on the last 24 hours of states) where
+    that fit exists: the decomposition and the direct curve fit make
+    different mistakes, and the blend is steadier than either alone.  The
+    story chain Ch.1 >= Ch.2 >= Ch.3 >= Ch.4 >= final >= 100% >= platinum is
+    enforced on the medians, Gone Fishing (id 2) is pinned at the print
+    ceiling 99.99% -- it has shown 100.00% at every observation, and the
+    scorer clamps the answer to 99.99, so a median even a little below the
+    ceiling pays full logit distance -- and the platinum is capped low:
+    almost nobody legitimately platinums the game in week one.
   * When the history has seen no refresh at all (the practice cases), E/N
     fitting is flat, so the measured first refresh (638 -> 3,868 players
     tracked) is used as a dilution prior: N is grown toward the target by the
@@ -30,8 +38,12 @@ Method (see the prep plan for the reasoning; this file is the whole model):
     still to come), and a fit-residual term (regression residual plus a
     1/sqrt(E) counting term) -- then multiplied by a calibration factor and
     shifted by a bias found by a rolling-origin backtest run inside this
-    program on the case's own history.  With too few origins the calibration
-    shrinks to its defaults.
+    program on the case's own history.  The backtest standardises each error
+    against the full spread the model would have used at that origin (all
+    three components at that horizon), not the fit term alone; standardising
+    against the fit term alone inflates the multiplier to its cap on every
+    history.  With too few origins the calibration shrinks to its defaults,
+    and long histories thin their origins so the backtest stays fast.
   * How much of the model runs depends on how many refresh states the case
     holds: >= 5 states, per-trophy fits; 3-4, tier-group fits; <= 2, pooled
     slope plus the dilution prior only.
@@ -73,9 +85,21 @@ RW_SIGMA = 0.5  # random-walk spread, logit units per sqrt(day), same as the hou
 SHRINK_K = 20.0  # earners at which a trophy's own slope gets weight 1/2
 EARNER_CATCHUP = 0.25  # exponent: new players earn at a lower rate than old ones
 PLATINUM_CAP = 0.4  # platinum median cap, percent
-GONE_FISHING_Q50 = 99.9  # id 2 median, percent: every tracked player has it
+GONE_FISHING_Q50 = 99.99  # id 2 median, percent: every tracked player has it
 SPREAD_MIN = 0.05
 SPREAD_MAX = 4.0
+WINDOW_H = 40.0  # fits use the states within this many hours of the last one
+
+
+def _recent(states):
+    """The states a trend fit should use: the recent window, so the frozen
+    launch regime and the first dilution jumps do not set the slopes that
+    get extrapolated.  The last state is always kept."""
+    if len(states) <= 4:
+        return states
+    cut = states[-1]["h"] - WINDOW_H
+    win = [s for s in states if s["h"] >= cut]
+    return win if len(win) >= 3 else states[-4:]
 
 # Story progression chain (ids): chapter order must not rise along the chain.
 CHAIN = [3, 4, 5, 6, 7, 14, 1]
@@ -185,6 +209,7 @@ def forecast_n(states, target_h):
     interval still to come, capped at two refreshes' worth.
     """
     n_last = states[-1]["n"]
+    states = _recent(states)
     if len(states) < 2:
         horizon_h = max(0.0, target_h - states[-1]["h"])
         refreshes = min(horizon_h / FIRST_INTERVAL_H, 2.0)
@@ -192,7 +217,7 @@ def forecast_n(states, target_h):
     xs = [math.log1p(s["h"]) for s in states]
     ys = [math.log(s["n"]) for s in states]
     m = len(states)
-    ws = [0.5 + (i / (m - 1)) for i in range(m)] if m > 1 else [1.0]
+    ws = [((i + 1) / m) ** 2 * 2.0 for i in range(m)] if m > 1 else [1.0]
     a, b, _ = fit_line(xs, ys, ws)
     n_fit = math.exp(a + b * math.log1p(target_h))
     # Lean toward the latest interval's slope when it runs hotter.
@@ -211,15 +236,16 @@ def forecast_n(states, target_h):
 def trophy_slopes(states):
     """Per-trophy ln E slopes against ln(1 + h), plus residual sds.
 
-    Returns (slopes, resids, last_e): slope None where the trophy never had
-    a positive earner count to fit on.  Zero earners are read as a
-    pseudo-count of 0.5 so the log stays finite.
+    Returns (slopes, resids, last_e, intercepts): slope and intercept None
+    where the trophy never had a positive earner count to fit on.  Zero
+    earners are read as a pseudo-count of 0.5 so the log stays finite.
     """
+    states = _recent(states)
     k = len(states[0]["e"])
     xs = [math.log1p(s["h"]) for s in states]
     m = len(states)
-    ws = [0.5 + (i / (m - 1)) for i in range(m)] if m > 1 else [1.0]
-    slopes, resids, last_e = [], [], []
+    ws = [((i + 1) / m) ** 2 * 2.0 for i in range(m)] if m > 1 else [1.0]
+    slopes, resids, last_e, intercepts = [], [], [], []
     for j in range(k):
         ys = []
         ok = True
@@ -232,12 +258,14 @@ def trophy_slopes(states):
         if not ok or len(states) < 2:
             slopes.append(None)
             resids.append(0.0)
+            intercepts.append(None)
         else:
-            _, b, r = fit_line(xs, ys, ws)
+            a, b, r = fit_line(xs, ys, ws)
             slopes.append(b)
             resids.append(r)
+            intercepts.append(a)
         last_e.append(states[-1]["e"][j])
-    return slopes, resids, last_e
+    return slopes, resids, last_e, intercepts
 
 
 def pooled_slope(slopes, last_e, idxs):
@@ -263,7 +291,7 @@ def forecast_medians(states, trophies, target_h, calib=(0.0, 1.0)):
     n_states = len(states)
     n_target = forecast_n(states, target_h)
     x_target = math.log1p(target_h)
-    slopes, resids, last_e = trophy_slopes(states)
+    slopes, resids, last_e, intercepts = trophy_slopes(states)
     all_idx = list(range(len(trophies)))
 
     # Pooled slope, and tier-group slopes for the 3-4 state regime.
@@ -297,21 +325,18 @@ def forecast_medians(states, trophies, target_h, calib=(0.0, 1.0)):
         else:
             beta = pooled  # <= 2 states: pooled slope only
         if n_states >= 2:
-            # Anchor the line at the last state's earners (pseudo-count floor).
+            # Anchor the line at the last state's earners (pseudo-count
+            # floor), then blend in log space with the regression line's own
+            # value at the target: anchoring alone lets one dipped refresh
+            # drag the whole extrapolation down with it.
             e_anchor = max(e_last, 0.5)
             e_loglin = math.exp(math.log(e_anchor) + beta * (x_target - x_last))
             e_target = e_loglin
-            # Increment-ratio estimate from the latest refresh interval.
-            if n_states >= 2:
-                s0, s1 = states[-2], states[-1]
-                dn = s1["n"] - s0["n"]
-                e0 = s0["e"][j]
-                if dn > 0 and e0 is not None:
-                    de = e_last - e0
-                    ratio = de / dn
-                    if ratio > 0:
-                        e_incr = e_last + ratio * (n_target - s1["n"])
-                        e_target = 0.5 * e_loglin + 0.5 * max(e_incr, 0.5)
+            if intercepts[j] is not None and n_states >= 5:
+                beta_j = slopes[j] if slopes[j] is not None else beta
+                e_line = math.exp(intercepts[j] + beta_j * x_target)
+                e_target = math.exp(0.5 * math.log(max(e_loglin, 0.5))
+                                    + 0.5 * math.log(max(e_line, 0.5)))
             e_target = max(e_target, 0.5)
         else:
             # One state: no slope exists.  Earners grow only part-way with
@@ -326,6 +351,23 @@ def forecast_medians(states, trophies, target_h, calib=(0.0, 1.0)):
         resid = resids[j] if n_states >= 2 else PRIOR_FIT_SD
         s_fit = math.sqrt(resid * resid + 1.0 / max(e_last, 1))
         spreads.append(s_fit)
+    # Blend with a curve-style median: logit rate fit on the last 24 hours
+    # of states, read at the target.  Only where that fit itself ran -- with
+    # too few states there is no curve estimate to blend with, and the
+    # decomposition stands alone.
+    x_t = math.log1p(target_h)
+    h_last = states[-1]["h"]
+    for j in range(len(trophies)):
+        pts_x, pts_y = [], []
+        for s in states:
+            if s["h"] >= h_last - 24.0 and s["rates"][j] is not None:
+                pts_x.append(math.log1p(s["h"]))
+                pts_y.append(logit(s["rates"][j]))
+        if len(pts_x) < 3 or len(set(pts_x)) < 2:
+            continue
+        a_c, b_c, _ = fit_line(pts_x, pts_y, [1.0] * len(pts_x))
+        lg_c = a_c + b_c * x_t
+        medians[j] = inv_logit(0.5 * logit(medians[j]) + 0.5 * lg_c)
     return medians, spreads, n_target
 
 
@@ -378,7 +420,8 @@ def backtest_calibration(states, trophies):
     if len(states) < 3:
         return (0.0, 1.0)
     errors = []
-    for origin in range(1, len(states) - 1):
+    step = max(1, len(states) // 24)
+    for origin in range(1, len(states) - 1, step):
         o_h = states[origin]["h"]
         later = None
         for s in states[origin + 1:]:
@@ -390,12 +433,16 @@ def backtest_calibration(states, trophies):
         med, s_fit, _ = forecast_medians(
             states[: origin + 1], trophies, later["h"], calib=(0.0, 1.0)
         )
+        s_rw_o = RW_SIGMA * math.sqrt(max((later["h"] - o_h) / 24.0, 0.0))
+        s_jump_o = jump_spread(states[: origin + 1], trophies, later["h"])
         for j, t in enumerate(trophies):
             actual = later["rates"][j]
             if actual is None:
                 continue
             err = logit(actual) - logit(med[j])
-            errors.append((err, s_fit[j]))
+            s_full = math.sqrt(s_rw_o * s_rw_o + s_jump_o * s_jump_o
+                               + s_fit[j] * s_fit[j])
+            errors.append((err, s_full))
     if len(errors) < 5:
         return (0.0, 1.0)
     n = len(errors)
@@ -433,11 +480,13 @@ def forecast_case(case, name):
     for j, trophy in enumerate(trophies):
         r = medians[j]
         if trophy["id"] == GONE_FISHING_ID:
-            # Pinned near 100%: every tracked player already has it, and the
-            # backtest bias and the refresh spread do not apply to a trophy
-            # that cannot move.  A fixed narrow spread keeps q05 near 99.8.
+            # Pinned at the print ceiling: every tracked player already has
+            # it, and the backtest bias and the refresh spread do not apply
+            # to a trophy that cannot move.  The spread only prices the
+            # small chance that a few newly tracked players have not yet
+            # finished the opening mission when the page is read.
             r = GONE_FISHING_Q50
-            s = 0.15
+            s = 0.3
             lg = logit(r)
         elif trophy["id"] == PLATINUM_ID:
             r = min(r, PLATINUM_CAP)

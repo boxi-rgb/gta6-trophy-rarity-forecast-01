@@ -19,14 +19,21 @@ decomposes the rate into earners E and players tracked N:
 - **Compress** the history into refresh states (consecutive identical reads
   carry no information), recovering E as `round(rate * N / 100)`.
 - **Extrapolate** `ln N` and `ln E` against `ln(1 + hours since release)` by
-  weighted least squares. Small-E trophies have their slope shrunk toward a
-  pooled slope (tier-group pooled when states are few, fully pooled when
-  there are two or fewer). A second E estimate from the latest increment
-  ratio `dE/dN` is averaged in when refreshes exist.
-- **Median** `r50 = E(target) / N(target)`. The story chain
-  Ch.1 ≥ Ch.2 ≥ Ch.3 ≥ Ch.4 ≥ final mission ≥ 100% ≥ platinum is enforced on
-  the medians; Gone Fishing (id 2) is pinned near 100% and the platinum is
-  capped low — almost nobody legitimately platinums the game in week one.
+  weighted least squares over the recent states (last 40 hours), with weights
+  growing quadratically toward the present. Small-E trophies have their slope
+  shrunk toward a pooled slope (tier-group pooled when states are few, fully
+  pooled when there are two or fewer). The E extrapolation blends the
+  last-state-anchored line with the regression line's own value at the
+  target, so one dipped refresh cannot drag the forecast down.
+- **Median** `r50 = E(target) / N(target)`, blended in logit space with a
+  curve-style median (logit rate fit on the last 24 hours of states) where
+  that fit exists — the decomposition and the direct curve fit make
+  different mistakes, and the blend is steadier than either alone. The story
+  chain Ch.1 ≥ Ch.2 ≥ Ch.3 ≥ Ch.4 ≥ final mission ≥ 100% ≥ platinum is
+  enforced on the medians; Gone Fishing (id 2) is pinned at the print ceiling
+  99.99% (it has shown 100.00% at every observation, and the scorer clamps
+  the answer to 99.99) and the platinum is capped low — almost nobody
+  legitimately platinums the game in week one.
 - **Dilution prior:** when the history has seen no refresh at all (the
   practice cases), the measured first refresh (638 → 3,868 players tracked)
   is used as a prior so the forecast still dilutes instead of predicting a
@@ -35,6 +42,8 @@ decomposes the rate into earners E and players tracked N:
   term, a refresh-jump term from the cross-trophy spread of log-rate jumps at
   past refreshes, and a fit-residual term — then calibrated by a
   rolling-origin backtest run inside the program on the case's own history.
+  The backtest standardises each error against the full spread the model
+  would have used at that origin, not the fit term alone.
 
 The program is fully deterministic (no randomness, fixed order, 4-decimal
 half-up rounding) and runs in well under a second per case.
